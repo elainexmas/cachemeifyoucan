@@ -142,12 +142,16 @@
 #'   if \code{x} and \code{y} are only allowed to be \code{TRUE} or
 #'   \code{FALSE}, with potentially four different kinds of data.frame
 #'   outputs, then up to four tables would be created.
-#' @param con SQLConnection. Database connection object.
+#' @param con SQLConnection or character. Database connection object, \emph{or}
+#'   character path to database.yml file. In the latter case, you will have to
+#'   specify an \code{env} parameter that determines the environment used for
+#'   the database.yml file.
 #' @param prefix character. Database table prefix. A different prefix should
 #'   be used for each cached function so that there are no table collisions.
-#'   Optional, but highly recommended.
+#'   Optional, but highly recommended. By default, the deparsed name of the
+#'   \code{uncached_function} parameter.
 #' @param env character. The environment of the database connection if con
-#'   is a yaml cofiguration file.
+#'   is a yaml cofiguration file. By default, \code{"cache"}.
 #' @param batch_size integer. Usually, the uncached operation is slow
 #'   (or we would not have to cache it!). However, fetching data from the
 #'   database is fast. To handle this dichotomy, the \code{batch_size}
@@ -193,7 +197,7 @@
 #' #       take the subset of IDs that have already been returned from
 #' #       a previous call to `cached_amazon_info`. Retrieve the data.frame
 #' #       for these records from an underlying database table.
-#' #   (2) The remaining IDs (those we have never passed to `cached_amazon_info`
+#' #   (2) The remaining IDs (those we have never passed to `cached_amazon_info`)
 #' #       should be fed to the base `amazon_info` function as if we had
 #' #       called it with this subset. This will yield another data.frame that
 #' #       was computed using live HTTP requests.
@@ -316,7 +320,8 @@
 #'   grab_sql_table(table_name = table_name, year = yr, month = mth, dbname = dbname)
 #' }
 #' }
-cache <- function(uncached_function, key, salt, con, prefix, env, batch_size = 100) {
+cache <- function(uncached_function, key, salt, con, prefix = deparse(uncached_function),
+                  env = "cache", batch_size = 100) {
   stopifnot(is.function(uncached_function),
     is.character(prefix), length(prefix) == 1,
     is.character(key), length(key) > 0,
@@ -392,54 +397,17 @@ cache <- function(uncached_function, key, salt, con, prefix, env, batch_size = 1
 
 #' Fetch the uncached function
 #'
-#' Calling the result will force the function to overwrite cache, but not read
-#' from it.
-#'
 #' If applied to a regular function it returns this function.
 #'
 #' @param fn function. The function that you want to uncache.
 #' @export
 uncached <- function(fn) {
   stopifnot(is.function(fn))
-  if (is(fn, "cached_function")) {</span></code>
-            </pre>
-          </div>
-        </div>
-        <div class="section">
-          <div class="markdown markdown-body">
-            <p>When calling the uncached function we want to overwrite cached values
-so that next time we call the cached version we will get the latest results.
-This can be useful when your cache become stale and you want to overwrite it with
-new data.</p>
-
-          </div>
-
-          <div class="code">
-            <pre>
-              <code class="R"><span class="spacer"></span></code>
-            </pre>
-          </div>
-        </div>
-        <div class="section">
-          <div class="markdown markdown-body">
-            <p>If a cached function is passed <strong>force.</strong> parameter we will get the becavior we want.
-We are going to <em>hijack</em> the function call and return a function with <strong>force. = TRUE</strong>.
-Borrowed the implementation from <a href="http://www.r-bloggers.com/hijacking-r-functions-changing-default-arguments/">here</a></p>
-
-          </div>
-
-          <div class="code">
-            <pre>
-              <code class="R"><span class="spacer">    hijack <- function (FUN, ...) {
-      .FUN <- FUN
-      args <- list(...)
-      invisible(lapply(seq_along(args), function(i) {
-          formals(.FUN)[[names(args)[i]]] <<- args[[i]]
-      }))
-      .FUN
-    }
-    alt_fn <- hijack(fn, force. = TRUE)
-  } else fn
+  if (is(fn, "cached_function")) {
+    environment(fn)$`_uncached_function`
+  } else {
+    fn
+  }
 }
 
 build_cached_function <- function(cached_function) {</span></code>
@@ -904,7 +872,7 @@ get_shards_for_table <- function(dbconn, tbl_name) {
 create_shards_table <- function(dbconn, tblname) {
   if (DBI::dbExistsTable(dbconn, tblname)) return(TRUE)
   sql <- paste0("CREATE TABLE ", tblname, " (table_name varchar(255) NOT NULL, shard_name varchar(255) NOT NULL);")
-  DBI::dbSendQuery(dbconn, sql)
+  DBI::dbGetQuery(dbconn, sql)
   TRUE
 }
 
@@ -944,7 +912,11 @@ db2df <- function(df, dbconn, key) {
 #' @param dbconn SQLConnection. A database connection.
 #' @param key. Identifier of database table.
 add_index <- function(dbconn, tblname, key, idx_name) {
-  DBI::dbSendQuery(dbconn, paste0('CREATE INDEX ', idx_name, ' ON ', tblname, '(', key, ')'))
+  if (!tolower(substring(idx_name, 1, 1)) %in% letters) {
+    stop(sprintf("Invalid index name '%s': must begin with an alphabetic character",
+                 idx_name))
+  }
+  DBI::dbGetQuery(dbconn, paste0('CREATE INDEX ', idx_name, ' ON ', tblname, '(', key, ')'))
   TRUE
 }
 
@@ -954,11 +926,12 @@ add_index <- function(dbconn, tblname, key, idx_name) {
 #' @param tblname character. Database table name.
 #' @param df data frame. The data frame to insert.
 dbWriteTableUntilSuccess <- function(dbconn, tblname, df) {
-  DBI::dbRemoveTable(dbconn, tblname)
+  if (DBI::dbExistsTable(dbconn, tblname))
+    DBI::dbRemoveTable(dbconn, tblname)
   success <- FALSE
   df[, vapply(df, function(x) all(is.na(x)), logical(1))] <- as.character(NA)
   while (!success) {
-    DBI::dbWriteTable(dbconn, tblname, df, append = FALSE, row.names = 0)
+    DBI::dbWriteTable(dbconn, tblname, df, append = FALSE, row.names = FALSE)
     num_rows <- DBI::dbGetQuery(dbconn, paste0('SELECT COUNT(*) FROM ', tblname))
     if (num_rows == nrow(df)) success <- TRUE
   }
@@ -1048,7 +1021,7 @@ For example, a row with ID 100000 will be stored as 10e+5, which is wrong.</p>
       raw_names <- DBI::dbGetQuery(dbconn, 'SELECT raw_name FROM column_names')[[1]]
       column_map <- column_map[!is.element(column_map$raw_name, raw_names), ]
       if (NROW(column_map) > 0) {
-        dbWriteTable(dbconn, 'column_names', column_map, append = TRUE, row.names = 0)
+        dbWriteTable(dbconn, 'column_names', column_map, append = TRUE, row.names = FALSE)
       }
     }
     TRUE
@@ -1137,7 +1110,7 @@ For example, a row with ID 100000 will be stored as 10e+5, which is wrong.</p>
         table_shard_map <- table_shard_map[table_shard_map$shard_name %nin% shards, ]
       }
       if (NROW(table_shard_map) > 0) {
-        DBI::dbWriteTable(dbconn, 'table_shard_map', table_shard_map, append = TRUE, row.names = 0)
+        DBI::dbWriteTable(dbconn, 'table_shard_map', table_shard_map, append = TRUE, row.names = FALSE)
       }
     }
     TRUE
@@ -1230,8 +1203,22 @@ don&#39;t even have to worry about creating new shards if something won&#39;t fi
           <div class="code">
             <pre>
               <code class="R"><span class="spacer">    used_columns <- c()
+</span></code>
+            </pre>
+          </div>
+        </div>
+        <div class="section">
+          <div class="markdown markdown-body">
+            <p>We want to sort our shards prior to writing.
+Unfortunately, <code>sort(1:11) == c(1, 10, 11, 2, 3, ...)</code> which is not what we want
+That&#39;s why we&#39;re using a slightly more ghetto solution</p>
 
-    lapply(sort(shard_names), function (shard, last, key) {</span></code>
+          </div>
+
+          <div class="code">
+            <pre>
+              <code class="R"><span class="spacer">    suffix <- strsplit(shard_names[1], '_')[[1]][2]
+    lapply(paste0('shard', seq(length(shard_names)), '_', suffix), function (shard, last, key) {</span></code>
             </pre>
           </div>
         </div>
@@ -1310,10 +1297,11 @@ In this case we should drop it, and pretend this table doesn&#39;t exist</p>
           <div class="code">
             <pre>
               <code class="R"><span class="spacer">          if (NCOL(one_row) == 2) {
-            DBI::dbSendQuery(dbconn, paste0("DROP TABLE ", shard))
+            DBI::dbGetQuery(dbconn, paste0("DROP TABLE ", shard))
           }
           columns <- colnames(df)
           columns <- columns[columns != key]
+          columns <- setdiff(columns, used_columns)
           columns <- c(columns[1:MAX_COLUMNS_PER_SHARD - 1], key)
           used_columns <<- append(used_columns, columns[columns != key])
           list(df = df[columns], shard_name = shard)
@@ -1374,46 +1362,13 @@ In this case we should drop it, and pretend this table doesn&#39;t exist</p>
         </div>
         <div class="section">
           <div class="markdown markdown-body">
-            <p>dbWriteTable(dbconn, tblname, df, row.names = 0, append = TRUE)</p>
-
-<p>Believe it or not, the above does not work! RPostgreSQL seems to have a
-bug that incorrectly serializes some kinds of data into the database.
-Thus we must roll up our sleeves and write our own INSERT query. :-(</p>
+            <p>Write out to postgres</p>
 
           </div>
 
           <div class="code">
             <pre>
-              <code class="R"><span class="spacer">    number_of_records_per_insert_query <- 250
-    slices <- slice(seq_len(nrow(df)), number_of_records_per_insert_query)
-</span></code>
-            </pre>
-          </div>
-        </div>
-        <div class="section">
-          <div class="markdown markdown-body">
-            <p>If we don&#39;t do this, we will get really weird bugs with numeric things stored as character
-For example, a row with ID 100000 will be stored as 10e+5, which is wrong.</p>
-
-          </div>
-
-          <div class="code">
-            <pre>
-              <code class="R"><span class="spacer">    old_options <- options(scipen = 20, digits = 20)
-    on.exit(options(old_options))
-
-    for (slice in slices) {
-      if (!append)  {
-        dbWriteTableUntilSuccess(dbconn, tblname, df)
-        append <- TRUE
-      } else {
-        insert_query <- build_insert_query(tblname, df[slice, , drop = FALSE])
-        if (is(dbconn, "MonetDBConnection")) {
-          DBI::dbSendQuery(dbconn, insert_query)
-        } else {
-          RPostgreSQL::postgresqlpqExec(dbconn, insert_query)
-        }
-    }}
+              <code class="R"><span class="spacer">    dbWriteTable(dbconn, tblname, df, row.names = FALSE, append = append)
   }
 </span></code>
             </pre>
@@ -1427,7 +1382,7 @@ For example, a row with ID 100000 will be stored as 10e+5, which is wrong.</p>
 
           <div class="code">
             <pre>
-              <code class="R"><span class="spacer">  DBI::dbGetQuery(dbconn, "BEGIN")
+              <code class="R"><span class="spacer">  DBI::dbGetQuery(dbconn, 'BEGIN')
   tryCatch({</span></code>
             </pre>
           </div>
@@ -1486,7 +1441,7 @@ For example, a row with ID 100000 will be stored as 10e+5, which is wrong.</p>
         </div>
         <div class="section">
           <div class="markdown markdown-body">
-            <p>The { column =&gt; MD5(column) } map doesn&#39;t exist yet. Create it!</p>
+            <p>The shard doesn&#39;t exist yet. Let&#39;s create it and index it by key!</p>
 
           </div>
 
@@ -1497,7 +1452,9 @@ For example, a row with ID 100000 will be stored as 10e+5, which is wrong.</p>
         return(invisible(TRUE))
       }
 
-      one_row <- DBI::dbGetQuery(dbconn, paste("SELECT * FROM ", tblname, " LIMIT 1"))
+      one_row <- if (DBI::dbExistsTable(dbconn, tblname)) {
+        DBI::dbGetQuery(dbconn, paste("SELECT * FROM ", tblname, " LIMIT 1"))
+      } else NULL
       if (NROW(one_row) == 0) {</span></code>
             </pre>
           </div>
@@ -1511,9 +1468,10 @@ Also, it&#39;s a great opportunity to enforce indexes on this table!</p>
 
           <div class="code">
             <pre>
-              <code class="R"><span class="spacer">        DBI::dbRemoveTable(dbconn, tblname)
+              <code class="R"><span class="spacer">        if (DBI::dbExistsTable(dbconn, tblname))
+          DBI::dbRemoveTable(dbconn, tblname)
         write_column_hashed_data(df, tblname, append = FALSE)
-        add_index(dbconn, tblname, key, digest::digest(paste0("i",tblname)))
+        add_index(dbconn, tblname, key, paste0("i", digest::digest(tblname)))
         return(invisible(TRUE))
       }
 </span></code>
@@ -1580,7 +1538,7 @@ Also, it&#39;s a great opportunity to enforce indexes on this table!</p>
     })
     },
     warning = function(w) {
-      message("An warning occured:", e)
+      message("An warning occured:", w)
       message("Rollback!")
       DBI::dbRollback(dbconn)
     },
@@ -1590,7 +1548,7 @@ Also, it&#39;s a great opportunity to enforce indexes on this table!</p>
       DBI::dbRollback(dbconn)
     },
     finally = {
-      DBI::dbCommit(dbconn)
+      DBI::dbGetQuery(dbconn, 'COMMIT')
     }
   )
   invisible(TRUE)
@@ -1699,7 +1657,7 @@ remove_old_key <- function(dbconn, tbl_name, ids, key) {
           <div class="code">
             <pre>
               <code class="R"><span class="spacer">  sapply(shards, function(shard) {
-    DBI::dbSendQuery(dbconn, paste0(
+    DBI::dbGetQuery(dbconn, paste0(
       "DELETE FROM ", shard, " WHERE ", id_column_name, " IN (",
       paste(ids, collapse = ","), ")"))
   })
@@ -1752,14 +1710,15 @@ db_connection <- function(database.yml, env = "cache",
         </div>
         <div class="section">
           <div class="markdown markdown-body">
-            <p>Authorization arguments needed by the DBMS instance</p>
+            <p>Authorization arguments needed by the DBMS instance
+Enforce rstats-db/RPostgres.</p>
 
           </div>
 
           <div class="code">
             <pre>
               <code class="R"><span class="spacer">  # TODO: (RK) Inform user if they forgot database.yml entries.
-  do.call(DBI::dbConnect, append(list(drv = DBI::dbDriver(config.database$adapter)),
+  do.call(DBI::dbConnect, append(list(drv = DBI::dbDriver('Postgres')),
     config.database[!names(config.database) %in% "adapter"]))
 }
 
@@ -1771,7 +1730,9 @@ db_connection <- function(database.yml, env = "cache",
 #' @return a list of database connection and if it can be re-established.
 #' @export
 build_connection <- function(con, env) {
-  if (is.character(con)) {
+  if (inherits(con, 'DBIConnection')) {
+    return(con)
+  } else if (is.character(con)) {
     return(db_connection(con, env))
   } else if (is.function(con)) {
     return(con())
@@ -1788,9 +1749,8 @@ build_connection <- function(con, env) {
 #' @return `TRUE` or `FALSE` indicating if the database connection is good.
 #' @export
 is_db_connected <- function(con) {
-  res <- tryCatch(fetch(DBI::dbSendQuery(con, "SELECT 1 + 1"))[1,1], error = function(e) NULL)
-  if (is.null(res) || res != 2) return(FALSE)
-  TRUE
+  res <- tryCatch(DBI::dbGetQuery(con, "SELECT 1")[1,1], error = function(e) NULL)
+  if (is.null(res) || res != 1) FALSE else TRUE
 }</span></code>
             </pre>
           </div>
